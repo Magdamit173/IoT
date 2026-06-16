@@ -3,3 +3,4 @@ system.db
 __pycache__/
 *.pyc
 env
+allowlist.csv

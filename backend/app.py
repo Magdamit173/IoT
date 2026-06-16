@@ -4,9 +4,12 @@ from datetime import datetime, timezone
 import sqlite3
 import re
 import os
+import threading
 from dotenv import load_dotenv
+import pandas as pd
+from sklearn.ensemble import IsolationForest
 
-load_dotenv()  # reads .env file into os.environ
+load_dotenv()
 
 app = Flask(__name__)
 
@@ -21,10 +24,6 @@ PORT       = int(os.getenv('PORT',   '5000'))
 
 if not API_KEY:
     raise RuntimeError("API_KEY is not set. Add it to your .env file.")
-
-# ---------------------------------------------------------------------------
-# DB init
-# ---------------------------------------------------------------------------
 
 def init_db():
     conn = sqlite3.connect(DB_FILE)
@@ -51,25 +50,23 @@ def init_db():
         humidity    REAL NOT NULL
     )''')
 
+    cursor.execute('''CREATE TABLE IF NOT EXISTS anomalies (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        timestamp   TEXT NOT NULL,
+        id_number   TEXT NOT NULL,
+        description TEXT NOT NULL
+    )''')
+
     conn.commit()
     conn.close()
-    print("Database initialized.")
 
 init_db()
-
-# ---------------------------------------------------------------------------
-# DB connection
-# ---------------------------------------------------------------------------
 
 def get_db_connection():
     conn = sqlite3.connect(DB_FILE, timeout=10.0)
     conn.execute('PRAGMA journal_mode=WAL')
     conn.row_factory = sqlite3.Row
     return conn
-
-# ---------------------------------------------------------------------------
-# Validators
-# ---------------------------------------------------------------------------
 
 def validate_uid(uid):
     if not isinstance(uid, str):
@@ -94,24 +91,70 @@ def validate_float(val, min_val, max_val):
         return False, None
 
 # ---------------------------------------------------------------------------
-# Middleware
+# Machine Learning Background Task
 # ---------------------------------------------------------------------------
+def run_ml_background(db_path):
+    try:
+        conn = sqlite3.connect(db_path, timeout=10.0)
+        df = pd.read_sql_query("SELECT * FROM attendance", conn)
+        
+        # Require 50 entries to establish a baseline
+        if len(df) < 50:
+            conn.close()
+            return
+            
+        df['timestamp'] = pd.to_datetime(df['timestamp'])
+        df['hour'] = df['timestamp'].dt.hour
+        df['day_of_week'] = df['timestamp'].dt.dayofweek
+        df['entry_numeric'] = df['entry_type'].map({'RFID': 0, 'Manual': 1})
+        
+        df = df.sort_values(by=['id_number', 'timestamp'])
+        df['time_diff'] = df.groupby('id_number')['timestamp'].diff().dt.total_seconds().fillna(86400)
+        
+        features = ['hour', 'day_of_week', 'entry_numeric', 'time_diff']
+        X = df[features].fillna(0)
+        
+        model = IsolationForest(contamination=0.05, random_state=42)
+        df['anomaly'] = model.fit_predict(X)
+        
+        anomalies = df[df['anomaly'] == -1]
+        cursor = conn.cursor()
+        
+        for _, row in anomalies.iterrows():
+            desc = "Suspicious behavior detected."
+            
+            # Example 1: Rapid manual entry after a recent scan
+            if row['time_diff'] < 120 and row['entry_numeric'] == 1:
+                desc = "Suspicious: Rapid manual entry right after previous scan."
+            # Example 2: Unusual manual shift (Isolation forest flags the deviation)
+            elif row['entry_numeric'] == 1:
+                desc = "Suspicious: Unusual shift to manual entry. Possible lost/broken RFID."
+            # Example 3 is implicitly handled: ML won't flag normal lunchtime habits.
+                
+            cursor.execute(
+                "SELECT 1 FROM anomalies WHERE timestamp = ? AND id_number = ?", 
+                (row['timestamp'].isoformat(), row['id_number'])
+            )
+            if not cursor.fetchone():
+                cursor.execute(
+                    "INSERT INTO anomalies (timestamp, id_number, description) VALUES (?, ?, ?)",
+                    (row['timestamp'].isoformat(), row['id_number'], desc)
+                )
+        
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass # Fail silently so the main server never crashes
 
 @app.before_request
 def enforce_security():
     if request.method == 'OPTIONS':
-        return    # let flask-cors handle preflight
+        return    
     if request.content_length and request.content_length > MAX_PAYLOAD:
         return jsonify({"error": "Payload Too Large"}), 413
-    # API key required for device-facing endpoints
     if request.path in ['/scan', '/manual', '/environment']:
         if request.headers.get('X-API-Key') != API_KEY:
             return jsonify({"error": "Unauthorized"}), 401
-
-
-# ---------------------------------------------------------------------------
-# Routes
-# ---------------------------------------------------------------------------
 
 @app.route('/scan', methods=['POST'])
 def scan():
@@ -141,6 +184,10 @@ def scan():
             (ts, user['name'], user['id_number'], 'RFID')
         )
         conn.commit()
+        
+        # Trigger ML analysis in the background
+        threading.Thread(target=run_ml_background, args=(DB_FILE,)).start()
+        
         return jsonify(dict(user)), 200
 
     except sqlite3.Error:
@@ -148,7 +195,6 @@ def scan():
     finally:
         if conn:
             conn.close()
-
 
 @app.route('/manual', methods=['POST'])
 def manual():
@@ -176,6 +222,10 @@ def manual():
             (ts, name, id_number, 'Manual', purpose)
         )
         conn.commit()
+        
+        # Trigger ML analysis in the background
+        threading.Thread(target=run_ml_background, args=(DB_FILE,)).start()
+        
         return jsonify({"status": "Success"}), 201
 
     except sqlite3.Error:
@@ -183,7 +233,6 @@ def manual():
     finally:
         if conn:
             conn.close()
-
 
 @app.route('/environment', methods=['POST'])
 def environment():
@@ -215,7 +264,6 @@ def environment():
         if conn:
             conn.close()
 
-
 @app.route('/status', methods=['GET'])
 def status():
     conn = None
@@ -233,9 +281,15 @@ def status():
         )
         att_latest = cursor.fetchall()
 
+        cursor.execute(
+            "SELECT timestamp, id_number, description FROM anomalies ORDER BY timestamp DESC LIMIT 5"
+        )
+        anom_latest = cursor.fetchall()
+
         return jsonify({
             "environment":        dict(env_latest) if env_latest else None,
-            "recent_attendance":  [dict(r) for r in att_latest]
+            "recent_attendance":  [dict(r) for r in att_latest],
+            "recent_anomalies":   [dict(a) for a in anom_latest]
         }), 200
 
     except sqlite3.Error:
@@ -243,11 +297,6 @@ def status():
     finally:
         if conn:
             conn.close()
-
-
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=PORT, debug=False)

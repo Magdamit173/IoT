@@ -1,318 +1,282 @@
-# Attendance System — Backend Documentation
+# Smart Attendance & Environment Monitoring API
 
-Flask + SQLite backend for an RFID-based attendance system.  
-Receives data from an ESP32 (RFID scanner + DHT11 sensor) and serves status to a tablet.
+A lightweight, robust Flask-based REST API designed for hardware-integrated student attendance tracking and environmental monitoring. It features an automated, background Machine Learning system (Isolation Forest) that actively detects suspicious login behavior based on historical student footprints.
+
+## Features
+
+* **Dual-Entry Attendance**: Supports both hardware RFID scanning and manual form entries.
+* **Environmental Logging**: Tracks temperature and humidity data from IoT sensors.
+* **AI Anomaly Detection**: Automatically analyzes attendance patterns in the background to flag suspicious activities (e.g., rapid double-logging, unusual shifts to manual entry).
+* **Security**: Payload limits and HTTP Header API Key enforcement for device-facing endpoints.
 
 ---
 
-## Setup
+# Installation & Setup
 
-### 1. Install dependencies
+## 1. Clone the Repository
+
+Clone the repository and navigate to the project directory.
+
+## 2. Install Dependencies
+
 ```bash
 pip install -r requirements.txt
 ```
 
-`requirements.txt` contains:
-```
-flask>=3.0.0
-flask-cors>=4.0.0
-python-dotenv>=1.0.0
-```
+> Ensure `pandas` and `scikit-learn` are included in your requirements for the ML features.
 
-### 2. Create your `.env` file
+## 3. Configure the Environment
 
-```bash
-echo "" > .env
-```
+Create a `.env` file in the root directory:
 
 ```env
-API_KEY=YourSuperSecretRandomString123
+API_KEY=HatdogNiAljur123
 DB_FILE=system.db
 MAX_PAYLOAD=2048
 PORT=5000
+ALLOWLIST_FILE=allowlist.csv
 ```
 
-> **Never commit `.env` to git.** It contains your secret API key.
+## 4. Run the Server
 
-### 3. Run the server
 ```bash
 python app.py
 ```
 
-The server starts on `http://0.0.0.0:5000` and is reachable by any device on the same LAN.  
-The SQLite database (`system.db`) is created automatically on first run.
+The database tables will automatically initialize on the first run.
 
 ---
 
-## Authentication
+# Database Tables
 
-Three endpoints require an `X-API-Key` header on every request:  
-`/scan`, `/manual`, `/environment`
+The SQLite database (`system.db`) utilizes WAL mode for concurrent reads and writes.
 
-The key must match the `API_KEY` value in your `.env`.
+## users
 
-```
-X-API-Key: YourSuperSecretRandomString123
-```
+Registered user profiles mapped to RFID UIDs.
 
-`/status` is public — no key needed (tablet polling).
-
----
-
-## Database tables
-
-### `users`
-Registered RFID cards. Populated manually or via a separate admin tool.
-
-| Column | Type | Description |
-|---|---|---|
-| `uid` | TEXT (PK) | RFID card UID, uppercase hex, 8–14 chars |
-| `name` | TEXT | Full name of the cardholder |
-| `id_number` | INTEGER | Student/employee ID number |
-| `photo_path` | TEXT | Optional path to photo file |
-
-**Add a user manually:**
-```bash
-sqlite3 system.db "INSERT INTO users (uid, name, id_number, photo_path) \
-  VALUES ('A1B2C3D4', 'Juan dela Cruz', 20240001, NULL);"
-```
-
-### `attendance`
-Log of every entry, both RFID and manual.
-
-| Column | Type | Description |
-|---|---|---|
-| `timestamp` | TEXT | UTC ISO-8601, e.g. `2026-06-09T23:50:18+00:00` |
-| `name` | TEXT | Person's name |
-| `id_number` | INTEGER | ID number |
-| `entry_type` | TEXT | `RFID` or `Manual` |
-| `purpose` | TEXT | Reason for visit (manual entries only) |
-
-### `environment`
-DHT11 sensor readings from the ESP32.
-
-| Column | Type | Description |
-|---|---|---|
-| `timestamp` | TEXT | UTC ISO-8601 |
-| `temperature` | REAL | °C, accepted range: −50.0 to 100.0 |
-| `humidity` | REAL | %, accepted range: 0.0 to 100.0 |
+| Column     | Type      | Description                              |
+| ---------- | --------- | ---------------------------------------- |
+| uid        | TEXT (PK) | Unique Hexadecimal RFID Tag (8–14 chars) |
+| name       | TEXT      | Full name of the student/staff           |
+| id_number  | TEXT      | Official School ID string                |
+| photo_path | TEXT      | Path to user image                       |
 
 ---
 
-## API Endpoints
+## attendance
 
-### `POST /scan`
-Called by the ESP32 when an RFID card is tapped.  
-Looks up the UID in `users`, logs an RFID attendance entry, and returns the user's data.
+Main log for all entry events.
 
-**Headers:**
-```
+| Column     | Type | Description                             |
+| ---------- | ---- | --------------------------------------- |
+| timestamp  | TEXT | UTC ISO-8601 string                     |
+| name       | TEXT | Name of the attendee                    |
+| id_number  | TEXT | Official School ID string               |
+| entry_type | TEXT | `"RFID"` or `"Manual"`                  |
+| purpose    | TEXT | Reason for manual entry (NULL for RFID) |
+
+---
+
+## environment
+
+Sensor data logs.
+
+| Column      | Type | Description                                 |
+| ----------- | ---- | ------------------------------------------- |
+| timestamp   | TEXT | UTC ISO-8601 string                         |
+| temperature | REAL | Temperature in Celsius (-50.0 to 100.0)     |
+| humidity    | REAL | Relative humidity percentage (0.0 to 100.0) |
+
+---
+
+## anomalies
+
+Logs generated automatically by the background machine learning thread.
+
+| Column      | Type         | Description                            |
+| ----------- | ------------ | -------------------------------------- |
+| id          | INTEGER (PK) | Auto-incrementing identifier           |
+| timestamp   | TEXT         | UTC ISO-8601 when the anomaly occurred |
+| id_number   | TEXT         | Student ID associated with the anomaly |
+| description | TEXT         | Description of the flagged behavior    |
+
+---
+
+# API Endpoints
+
+> **Global Security Note:** Endpoints interacting with hardware (`/scan`, `/manual`, `/environment`) require the `X-API-Key` header. The dashboard endpoint (`/status`) does not.
+
+---
+
+## POST /scan
+
+Triggered by the hardware RFID scanner.
+
+Logs attendance and triggers a background ML check.
+
+### Headers
+
+```http
+X-API-Key: <your_key>
 Content-Type: application/json
-X-API-Key: <your key>
 ```
 
-**Request body:**
+### Payload
+
 ```json
 {
   "uid": "A1B2C3D4"
 }
 ```
 
-**UID rules:** 8–14 characters, hex only (`A–F`, `0–9`), case-insensitive (normalized to uppercase internally).
+### Success (200 OK)
 
-**Responses:**
+Returns the user profile data.
 
-| Status | Body | Meaning |
-|---|---|---|
-| `200 OK` | `{ "name": "...", "id_number": 123, "photo_path": null }` | Card found, entry logged |
-| `400 Bad Request` | `{ "error": "Bad Request" }` | Missing `uid` field |
-| `400 Bad Request` | `{ "error": "Invalid UID" }` | UID fails hex/length validation |
-| `401 Unauthorized` | `{ "error": "Unauthorized" }` | Wrong or missing API key |
-| `404 Not Found` | `{ "error": "Not Found" }` | UID not registered in `users` table |
-| `500` | `{ "error": "Server Error" }` | Database error |
+### Errors
 
-**ESP32 example (Arduino/C++):**
-```cpp
-HTTPClient http;
-http.begin("http://192.168.1.100:5000/scan");
-http.addHeader("Content-Type", "application/json");
-http.addHeader("X-API-Key", "YourSuperSecretRandomString123");
-
-String body = "{\"uid\":\"" + uidString + "\"}";
-int code = http.POST(body);
-```
+* 400 Invalid UID
+* 404 User Not Found
 
 ---
 
-### `POST /manual`
-Called when someone fills in the manual entry form on the tablet.  
-Logs a manual attendance entry directly to the `attendance` table.
+## POST /manual
 
-**Headers:**
-```
+Triggered by the software UI for users without their RFID cards.
+
+Logs attendance and triggers a background ML check.
+
+### Headers
+
+```http
+X-API-Key: <your_key>
 Content-Type: application/json
-X-API-Key: <your key>
 ```
 
-**Request body:**
+### Payload
+
 ```json
 {
   "name": "Juan dela Cruz",
-  "id": 20240001,
-  "purpose": "Library visit"
+  "id": "20240072-E",
+  "purpose": "Library Visit"
 }
 ```
 
-> Note: the field is `id`, not `id_number`.
+> `id` must be a non-empty alphanumeric string.
 
-**Field rules:**
+### Success (201 Created)
 
-| Field | Type | Rules |
-|---|---|---|
-| `name` | string | 1–50 chars, letters/numbers/spaces/hyphens/dots/commas |
-| `id` | integer | Positive whole number |
-| `purpose` | string | 1–100 chars, same character rules as name |
-
-**Responses:**
-
-| Status | Body | Meaning |
-|---|---|---|
-| `201 Created` | `{ "status": "Success" }` | Entry logged |
-| `400 Bad Request` | `{ "error": "Bad Request" }` | Missing required field |
-| `400 Bad Request` | `{ "error": "Invalid Input: id must be a positive integer" }` | Bad ID value |
-| `400 Bad Request` | `{ "error": "Invalid Input" }` | Name or purpose fails validation |
-| `401 Unauthorized` | `{ "error": "Unauthorized" }` | Wrong or missing API key |
-
-**Fetch example (JavaScript):**
-```js
-await fetch("http://localhost:5000/manual", {
-  method: "POST",
-  headers: {
-    "Content-Type": "application/json",
-    "X-API-Key": "YourSuperSecretRandomString123"
-  },
-  body: JSON.stringify({
-    name: "Juan dela Cruz",
-    id: 20240001,
-    purpose: "Library visit"
-  })
-});
-```
-
----
-
-### `POST /environment`
-Called by the ESP32 on each DHT11 sensor reading.  
-Stores temperature and humidity with a server-generated UTC timestamp.
-
-**Headers:**
-```
-Content-Type: application/json
-X-API-Key: <your key>
-```
-
-**Request body:**
 ```json
 {
-  "temperature": 27.5,
-  "humidity": 65.0
+  "status": "Success"
 }
 ```
 
-**Responses:**
+### Errors
 
-| Status | Body | Meaning |
-|---|---|---|
-| `201 Created` | `{ "status": "Success" }` | Reading stored |
-| `400 Bad Request` | `{ "error": "Bad Request" }` | Missing field |
-| `400 Bad Request` | `{ "error": "Invalid sensor values" }` | Value out of accepted range |
-| `401 Unauthorized` | `{ "error": "Unauthorized" }` | Wrong or missing API key |
-
-**ESP32 example (Arduino/C++):**
-```cpp
-HTTPClient http;
-http.begin("http://192.168.1.100:5000/environment");
-http.addHeader("Content-Type", "application/json");
-http.addHeader("X-API-Key", "YourSuperSecretRandomString123");
-
-String body = "{\"temperature\":" + String(temp, 1) + ",\"humidity\":" + String(hum, 1) + "}";
-int code = http.POST(body);
-```
+* 400 Invalid Input
 
 ---
 
-### `GET /status`
-Polled by the tablet to get the current system state.  
-Returns the latest environment reading and the 5 most recent attendance entries.  
-**No API key required.**
+## POST /environment
 
-**Request:** No body, no headers needed.
+Triggered by the hardware IoT sensors.
 
-**Response `200 OK`:**
+### Headers
+
+```http
+X-API-Key: <your_key>
+Content-Type: application/json
+```
+
+### Payload
+
+```json
+{
+  "temperature": 26.5,
+  "humidity": 60.2
+}
+```
+
+### Success (201 Created)
+
+```json
+{
+  "status": "Success"
+}
+```
+
+### Errors
+
+* 400 Invalid Sensor Values
+
+---
+
+## GET /status
+
+Public dashboard endpoint used to fetch the current state of the system.
+
+### Headers
+
+None required.
+
+### Success (200 OK)
+
 ```json
 {
   "environment": {
-    "timestamp": "2026-06-09T23:50:22+00:00",
+    "timestamp": "2026-06-16T23:50:22+00:00",
     "temperature": 27.5,
     "humidity": 65.0
   },
   "recent_attendance": [
     {
-      "timestamp": "2026-06-09T23:50:18+00:00",
+      "timestamp": "2026-06-16T23:50:18+00:00",
       "name": "Juan dela Cruz",
-      "id_number": 20240001,
+      "id_number": "20240001",
       "entry_type": "Manual",
-      "purpose": "Library visit"
+      "purpose": "Library Visit"
+    }
+  ],
+  "recent_anomalies": [
+    {
+      "id_number": "20240072-E",
+      "timestamp": "2026-06-16T17:05:19+00:00",
+      "description": "Suspicious: Unusual shift to manual entry. Possible lost/broken RFID."
     }
   ]
 }
 ```
 
-`environment` is `null` if no sensor data has been received yet.  
-`recent_attendance` is an empty array `[]` if no entries exist.
-
-**Fetch example (JavaScript):**
-```js
-const res = await fetch("http://localhost:5000/status");
-const data = await res.json();
-console.log(data.environment.temperature);
-```
-
 ---
 
-## Validation rules summary
+# Machine Learning Integration (Isolation Forest)
 
-| Field | Rule |
-|---|---|
-| `uid` | Hex string, 8–14 chars (`A-F0-9`), case-insensitive |
-| `name` | 1–50 chars, `a-zA-Z0-9 -.,` only |
-| `id` | Positive integer (`> 0`) |
-| `purpose` | 1–100 chars, same as name |
-| `temperature` | Float, −50.0 to 100.0 |
-| `humidity` | Float, 0.0 to 100.0 |
-| Payload size | Max 2048 bytes (configurable via `MAX_PAYLOAD` in `.env`) |
+The system features an automated tracking system that cross-references individual student habits against global database patterns.
 
----
+## How It Works
 
-## Project structure
+1. A background thread silently executes after every successful `/scan` or `/manual` entry.
+2. The model requires a minimum of **50 attendance records** in the database to establish a baseline. Before this threshold, anomaly checks are bypassed.
+3. The model evaluates four core vectors:
 
-```
-project/
-├── app.py            # Flask backend
-├── .env              # Your secrets (never commit this)
-├── .env.example      # Template to copy from
-├── requirements.txt  # Python dependencies
-├── system.db         # SQLite database (auto-created on first run)
-└── tester.html       # Browser-based test UI for all endpoints
-```
+   * **Time of day** (`hour`)
+   * **Day of the week** (`day_of_week`)
+   * **Entry method** (`entry_numeric`)
+   * **Frequency** (`time_diff`)
 
----
+## Flagged Behaviors
 
-## Quick reference — which method for which endpoint
+### Rapid Dual Logging
 
-| Endpoint | Method | Who calls it | Key required |
-|---|---|---|---|
-| `/scan` | POST | ESP32 | Yes |
-| `/manual` | POST | Tablet / frontend | Yes |
-| `/environment` | POST | ESP32 | Yes |
-| `/status` | GET | Tablet | No |
+A manual entry occurs within 1–2 minutes of an RFID scan under the same ID.
+
+### Sudden Method Shifts
+
+A user with a strict history of RFID usage suddenly shifts to manual entry.
+
+### Time Outliers
+
+Entries recorded significantly outside normal student traffic hours.
